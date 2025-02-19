@@ -1,0 +1,5 @@
+numpy==1.23.5
+opencv-python==4.8.1.78
+Pillow==10.0.0
+tflite-runtime
+RPi.GPIO==0.7.1

@@ -1,0 +1,14 @@
+services:
+  bird-detector:
+    build: .
+    privileged: true  # Needed for GPIO access
+    devices:
+      - /dev/gpiomem:/dev/gpiomem  # For GPIO access
+    volumes:
+      - ./results:/app/results  # For saving frames
+    environment:
+      - RTSP_URL=rtsp://your_camera_url
+      - SAVE_FRAMES=false
+      - DETECTION_THRESHOLD=0.5
+      - COOLDOWN_PERIOD=60  # seconds
+    restart: unless-stopped
