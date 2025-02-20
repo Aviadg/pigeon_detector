@@ -7,7 +7,6 @@ from datetime import datetime
 import time
 import os
 import RPi.GPIO as GPIO
-import argparse
 
 class RTSPBirdMonitor:
     def __init__(self, rtsp_url, model_path, threshold=0.5, save_frames=False, cooldown_period=60):
@@ -36,7 +35,7 @@ class RTSPBirdMonitor:
         self.in_cooldown = False
         
         # Setup GPIO
-        self.led_pin = 20
+        self.led_pin = 21
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.led_pin, GPIO.OUT)
         GPIO.output(self.led_pin, GPIO.LOW)
@@ -48,6 +47,7 @@ class RTSPBirdMonitor:
         
         # Initialize video capture
         self.cap = None
+        self.last_detection_check = 0  # Track when we last ran detection
         
     def __del__(self):
         GPIO.cleanup()
@@ -56,13 +56,22 @@ class RTSPBirdMonitor:
         if self.cap is not None:
             self.cap.release()
         
+        # Enhanced camera connection with optimized settings
         self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
         
         if not self.cap.isOpened():
             raise Exception("Failed to connect to RTSP stream")
-            
+        
+        # Optimize for latency
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+    def flush_buffer(self):
+        """Flush the buffer to get the latest frame"""
+        for _ in range(5):  # Increased from 2 to 5 for better buffer clearing
+            self.cap.grab()
             
     def preprocess_frame(self, frame):
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -124,43 +133,47 @@ class RTSPBirdMonitor:
     
     def run(self):
         print(f"Starting RTSP monitoring (Image size: {self.img_size}x{self.img_size})...")
-        last_frame_time = 0
+        system_start_time = time.time()
+        frame_count = 0
         
         while True:
             try:
-                current_time = time.time()
-                if current_time - last_frame_time < 1.0:
-                    time.sleep(1.0 - (current_time - last_frame_time))
-                    current_time = time.time()
-                
                 if self.cap is None or not self.cap.isOpened():
                     print("Reconnecting to camera...")
                     self.connect_camera()
                 
-                for _ in range(2):
-                    self.cap.grab()
-                
+                # Get current frame with optimized buffer management
+                self.flush_buffer()
                 ret, frame = self.cap.read()
+                
                 if not ret or frame is None or frame.size == 0:
                     print("Failed to grab valid frame, attempting to reconnect...")
                     self.connect_camera()
                     continue
                 
-                start_process = time.time()
-                confidence = self.predict_frame(frame)
-                process_time = time.time() - start_process
+                # Update frame count and calculate timing
+                current_time = time.time()
+                frame_count += 1
+                elapsed_time = current_time - system_start_time
                 
-                confirmed_detection = self.handle_detection(confidence)
-                
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"\nTimestamp: {timestamp}")
-                print(f"Processing time: {process_time:.3f} seconds")
-                print(f"Confidence: {confidence:.2%}")
-                print(f"Consecutive detections: {self.consecutive_detections}")
-                print(f"In cooldown: {self.in_cooldown}")
-                print("-" * 50)
-                
-                last_frame_time = current_time
+                # Only run detection once per second
+                if current_time - self.last_detection_check >= 1.0:
+                    start_process = time.time()
+                    confidence = self.predict_frame(frame)
+                    process_time = time.time() - start_process
+                    
+                    confirmed_detection = self.handle_detection(confidence)
+                    self.last_detection_check = current_time
+                    
+                    # Print status
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"\nTimestamp: {timestamp}")
+                    print(f"Processing time: {process_time:.3f} seconds")
+                    print(f"Confidence: {confidence:.2%}")
+                    print(f"Consecutive detections: {self.consecutive_detections}")
+                    print(f"In cooldown: {self.in_cooldown}")
+                    print(f"Average FPS: {frame_count/elapsed_time:.2f}")
+                    print("-" * 50)
                 
             except KeyboardInterrupt:
                 print("\nStopping monitoring...")
@@ -188,6 +201,10 @@ def main():
                       help='Cooldown period in seconds after confirmed detection')
 
     args = parser.parse_args()
+    
+    # Add TCP transport if not specified in URL
+    if 'rtsp://' in args.rtsp_url and '?' not in args.rtsp_url:
+        args.rtsp_url += '?tcp'
     
     monitor = RTSPBirdMonitor(
         rtsp_url=args.rtsp_url,
