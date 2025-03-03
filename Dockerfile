@@ -21,4 +21,4 @@ RUN pip install --no-cache-dir --extra-index-url https://www.piwheels.org/simple
 COPY src/ ./src/
 COPY models/ ./models/
 
-CMD ["python", "-u", "src/bird_monitor.py"]
+CMD ["python", "-u", "src/yolo_bird_monitor.py"]
