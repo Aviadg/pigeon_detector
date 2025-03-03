@@ -226,7 +226,7 @@ class YOLOBirdMonitor:
         for box in result.boxes:
             cls = int(box.cls.item())
             conf = box.conf.item()
-            
+            print(f"Detected class {cls} with confidence {conf:.2%}")
             if cls == self.bird_class_id and conf > max_confidence:
                 max_confidence = conf
         
