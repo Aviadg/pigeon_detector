@@ -4,10 +4,84 @@ import argparse
 from datetime import datetime
 import time
 import os
+import threading
+import queue
 import RPi.GPIO as GPIO
 
+class FrameGrabber(threading.Thread):
+    """Thread class for grabbing frames from RTSP stream in background"""
+    def __init__(self, rtsp_url, frame_queue, max_queue_size=2):
+        super().__init__()
+        self.rtsp_url = rtsp_url
+        self.frame_queue = frame_queue
+        self.max_queue_size = max_queue_size
+        self.running = True
+        self.daemon = True  # Thread will exit when main program exits
+        self.total_frames = 0
+        self.reconnect_count = 0
+        
+    def run(self):
+        # Connection options for RTSP
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|analyzeduration;1000000|buffer_size;1000000|max_delay;500000"
+        
+        while self.running:
+            try:
+                # Create a new connection each time for freshness
+                self.reconnect_count += 1
+                print(f"Connecting to camera (attempt #{self.reconnect_count}): {self.rtsp_url}")
+                
+                cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                
+                if not cap.isOpened():
+                    print("Failed to open RTSP stream, retrying in 3 seconds...")
+                    time.sleep(3)
+                    continue
+                
+                # Try different buffer settings
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                print(f"Successfully connected to {self.rtsp_url}")
+                
+                # Only read limited number of frames before reconnecting
+                frame_count = 0
+                max_frames_per_connection = 50  # Reconnect after this many frames
+                
+                while self.running and frame_count < max_frames_per_connection:
+                    # Clear any buffered frames
+                    for _ in range(2):
+                        cap.grab()
+                        
+                    # Get a fresh frame
+                    ret, frame = cap.read()
+                    
+                    if not ret or frame is None or frame.size == 0:
+                        print("Failed to grab valid frame, reconnecting...")
+                        break
+                    
+                    # Put frame in queue, replacing old frame if queue is full
+                    if self.frame_queue.full():
+                        try:
+                            self.frame_queue.get_nowait()  # Discard oldest frame
+                        except queue.Empty:
+                            pass
+                    
+                    self.frame_queue.put(frame)
+                    frame_count += 1
+                    self.total_frames += 1
+                    
+                    # Small sleep to prevent CPU overuse
+                    time.sleep(0.01)
+                
+                print(f"Periodic reconnect after {frame_count} frames")
+                # Release this capture and create a new one in next loop
+                cap.release()
+                
+            except Exception as e:
+                print(f"Error in frame grabber: {str(e)}")
+                time.sleep(3)  # Wait before retrying
+
 class YOLOBirdMonitor:
-    def __init__(self, rtsp_url, model_path, threshold=0.5, 
+    def __init__(self, rtsp_url, model_path, threshold=0.3, 
                  save_frames=False, cooldown_period=60, bird_class_id=14):
         # Store configuration
         self.rtsp_url = rtsp_url
@@ -34,19 +108,18 @@ class YOLOBirdMonitor:
             self.results_dir = "results"
             os.makedirs(self.results_dir, exist_ok=True)
         
-        # Initialize video capture
-        self.cap = None
-        self.last_detection_check = 0  # Track when we last ran detection
-        self.reconnect_count = 0
-        self.last_frame_time = 0
+        # Setup frame queue and grabber thread
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.grabber = None
         
         # Load model flag - defer actual loading until first use
         self.model = None
         
     def __del__(self):
         GPIO.cleanup()
-        if self.cap is not None:
-            self.cap.release()
+        if self.grabber is not None:
+            self.grabber.running = False
+            self.grabber.join(timeout=1.0)
     
     def load_model(self):
         """Load the YOLO model - only when needed"""
@@ -68,100 +141,26 @@ class YOLOBirdMonitor:
         except Exception as e:
             print(f"Failed to load YOLO model: {str(e)}")
             raise
-        
-    def connect_camera(self):
-        """Connect to the RTSP camera stream with improved settings"""
-        if self.cap is not None:
-            self.cap.release()
+    
+    def start_frame_grabber(self):
+        """Start the background frame grabber thread"""
+        if self.grabber is None or not self.grabber.is_alive():
+            self.grabber = FrameGrabber(self.rtsp_url, self.frame_queue)
+            self.grabber.start()
+            print("Frame grabber thread started")
             
-        # Completely reset the connection
-        self.reconnect_count += 1
-        print(f"Connecting to camera (attempt #{self.reconnect_count}): {self.rtsp_url}")
-        
-        # Try different connection methods based on prior success
-        if self.reconnect_count % 3 == 0:
-            # Every third attempt, try with FFMPEG backend
-            print("Trying FFMPEG backend...")
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-        elif self.reconnect_count % 3 == 1:
-            # First and every third attempt thereafter, try with default backend
-            print("Trying default backend...")
-            self.cap = cv2.VideoCapture(self.rtsp_url)
-        else:
-            # Second and every third attempt thereafter, try with GSTREAMER backend
-            print("Trying GSTREAMER backend...")
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_GSTREAMER)
-        
-        if not self.cap.isOpened():
-            print("Failed to open camera connection!")
-            return False
-        
-        # Try to disable buffering
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        # Try to limit frame rate
-        self.cap.set(cv2.CAP_PROP_FPS, 1)
-        
-        # Try to reset position
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
-        # Read a test frame to confirm connection
-        ret, frame = self.cap.read()
-        if not ret or frame is None or frame.size == 0:
-            print("Could open camera but failed to read frame!")
-            self.cap.release()
-            self.cap = None
-            return False
+            # Wait for first frame
+            print("Waiting for first frame...")
+            start_wait = time.time()
+            while self.frame_queue.empty():
+                time.sleep(0.1)
+                if time.time() - start_wait > 30:  # Wait up to 30 seconds
+                    print("Timeout waiting for first frame")
+                    return False
             
-        print(f"Successfully connected to camera. Frame size: {frame.shape}")
+            print("Received first frame, stream is active")
+            return True
         return True
-
-    def get_new_frame(self):
-        """Get a new frame from the camera with improved handling"""
-        # Check if we have a valid camera connection
-        if self.cap is None or not self.cap.isOpened():
-            if not self.connect_camera():
-                time.sleep(2)  # Wait before retrying
-                return None
-        
-        # Clear any buffered frames
-        for _ in range(10):  # Drop more frames to ensure we get a fresh one
-            self.cap.grab()
-        
-        # Try to get a new frame
-        ret, frame = self.cap.read()
-        
-        # Validate the frame
-        if not ret or frame is None or frame.size == 0:
-            print("Failed to grab valid frame from camera")
-            # Force reconnect
-            self.cap.release()
-            self.cap = None
-            return None
-        
-        # Check for frame similarity (stuck frame detection)
-        current_time = time.time()
-        if hasattr(self, 'last_frame') and self.last_frame is not None:
-            # Calculate rough similarity using mean of absolute difference
-            diff = cv2.absdiff(frame, self.last_frame)
-            mean_diff = np.mean(diff)
-            
-            # If frames are too similar and it's been more than 2 seconds
-            if mean_diff < 0.1 and (current_time - self.last_frame_time) > 2.0:
-                print(f"WARNING: Detected potentially stuck frame (diff: {mean_diff:.4f})")
-                
-                # Try reconnecting if frames appear stuck
-                if mean_diff < 0.05:
-                    print("Frame appears stuck, reconnecting...")
-                    self.cap.release()
-                    self.cap = None
-                    return None
-        
-        # Update frame tracking
-        self.last_frame = frame.copy()
-        self.last_frame_time = current_time
-        
-        return frame
     
     def save_frame(self, frame, confidence):
         """Save the processed frame if enabled"""
@@ -192,10 +191,10 @@ class YOLOBirdMonitor:
         # Process detection
         if confidence >= self.threshold:
             self.consecutive_detections += 1
-            print(f"Bird detected! Consecutive detections: {self.consecutive_detections}/3")
+            print(f"Bird detected! Confidence: {confidence:.2%}, Consecutive detections: {self.consecutive_detections}/3")
             
             if self.consecutive_detections >= 3:
-                print("Confirmed bird detection!")
+                print("🐦 CONFIRMED BIRD DETECTION! 🐦")
                 GPIO.output(self.led_pin, GPIO.HIGH)
                 self.last_detection_time = current_time
                 self.in_cooldown = True
@@ -226,7 +225,7 @@ class YOLOBirdMonitor:
         for box in result.boxes:
             cls = int(box.cls.item())
             conf = box.conf.item()
-            print(f"Detected class {cls} with confidence {conf:.2%}")
+            
             if cls == self.bird_class_id and conf > max_confidence:
                 max_confidence = conf
         
@@ -238,70 +237,110 @@ class YOLOBirdMonitor:
     
     def run(self):
         """Main monitoring loop"""
-        print(f"Starting YOLO bird monitoring (one detection per second)...")
+        print(f"Starting YOLO bird monitoring with threaded frame grabber...")
         system_start_time = time.time()
-        frame_count = 0
+        processed_frames = 0
+        last_status_time = time.time()
+        
+        # Start the frame grabber thread
+        if not self.start_frame_grabber():
+            print("Failed to start frame grabber, exiting")
+            return
         
         while True:
             try:
-                # Get a new frame with improved handling
-                frame = self.get_new_frame()
+                # Check if grabber is running
+                if self.grabber is None or not self.grabber.is_alive():
+                    print("Frame grabber thread died, restarting...")
+                    if not self.start_frame_grabber():
+                        print("Failed to restart frame grabber, waiting...")
+                        time.sleep(5)
+                        continue
                 
-                if frame is None:
-                    # If we couldn't get a valid frame, retry after a delay
-                    print("Failed to get valid frame, retrying...")
-                    time.sleep(1)
+                # Try to get a frame
+                try:
+                    if self.frame_queue.empty():
+                        print("Frame queue empty, waiting...")
+                        time.sleep(0.5)
+                        continue
+                    
+                    frame = self.frame_queue.get(timeout=1.0)
+                except queue.Empty:
+                    print("Timeout getting frame from queue")
                     continue
                 
-                # Update frame count
-                frame_count += 1
                 current_time = time.time()
                 
-                # Only run detection once per second
-                if current_time - self.last_detection_check >= 1.0:
-                    # Detect birds in the frame
-                    annotated_frame, confidence, inference_time = self.detect_birds(frame)
-                    
-                    # Handle detection result
-                    confirmed_detection = self.handle_detection(confidence)
-                    
-                    # Save the frame if enabled
+                # Detect birds in the frame
+                annotated_frame, confidence, inference_time = self.detect_birds(frame)
+                
+                # Handle detection result
+                confirmed_detection = self.handle_detection(confidence)
+                
+                # Save the frame if enabled
+                if self.save_frames or confirmed_detection:
                     self.save_frame(annotated_frame, confidence)
-                    
-                    # Update last detection time
-                    self.last_detection_check = current_time
-                    
-                    # Print status
+                
+                # Update processed frame count
+                processed_frames += 1
+                
+                # Print status every 10 seconds
+                if current_time - last_status_time >= 10.0:
                     elapsed_time = current_time - system_start_time
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"\nTimestamp: {timestamp}")
-                    print(f"Processing time: {inference_time:.3f} seconds")
-                    print(f"Confidence: {confidence:.2%}")
+                    
+                    print(f"\n{'=' * 50}")
+                    print(f"Status at: {timestamp}")
+                    print(f"Uptime: {elapsed_time:.1f} seconds")
+                    print(f"Frames acquired: {self.grabber.total_frames}")
+                    print(f"Frames processed: {processed_frames}")
+                    if elapsed_time > 0:
+                        print(f"Processing rate: {processed_frames/elapsed_time:.2f} fps")
+                    print(f"Last detection confidence: {confidence:.2%}")
+                    print(f"Last processing time: {inference_time:.3f} seconds")
                     print(f"Consecutive detections: {self.consecutive_detections}")
                     print(f"In cooldown: {self.in_cooldown}")
-                    print(f"Frames processed: {frame_count}")
-                    if elapsed_time > 0:
-                        print(f"Average frame rate: {frame_count/elapsed_time:.2f} fps")
-                    print("-" * 50)
+                    if self.in_cooldown:
+                        cooldown_remaining = self.cooldown_period - (current_time - self.last_detection_time)
+                        print(f"Cooldown remaining: {cooldown_remaining:.1f} seconds")
+                    print(f"{'=' * 50}")
+                    
+                    last_status_time = current_time
                 
-                # Sleep to prevent CPU overuse and maintain ~1 fps processing rate
-                # Use adaptive sleep to maintain close to 1 fps
+                # Sleep to maintain approximately 1 fps 
+                # (adjusted for processing time to keep consistent pace)
                 processing_time = time.time() - current_time
-                sleep_time = max(0, 1.0 - processing_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                sleep_time = max(0.01, 1.0 - processing_time)
+                time.sleep(sleep_time)
                 
             except KeyboardInterrupt:
                 print("\nStopping monitoring...")
                 break
             except Exception as e:
-                print(f"Error: {str(e)}")
-                print("Waiting 5 seconds before retry...")
+                print(f"Error in main loop: {str(e)}")
                 time.sleep(5)
                 continue
         
-        if self.cap is not None:
-            self.cap.release()
+        # Clean up
+        if self.grabber is not None:
+            self.grabber.running = False
+            self.grabber.join(timeout=1.0)
+
+def install_dependencies():
+    """Install required dependencies if not already installed"""
+    try:
+        import ultralytics
+        print("Ultralytics already installed")
+    except ImportError:
+        print("Installing Ultralytics YOLO...")
+        os.system("pip install ultralytics")
+    
+    try:
+        import cv2
+        print("OpenCV already installed")
+    except ImportError:
+        print("Installing OpenCV...")
+        os.system("pip install opencv-python")
 
 def main():
     parser = argparse.ArgumentParser(description='YOLO Bird Detection from RTSP Stream')
@@ -309,8 +348,8 @@ def main():
                       help='RTSP URL for camera stream')
     parser.add_argument('--model-path', type=str, default='yolov8n.pt',
                       help='Path to Ultralytics YOLO model')
-    parser.add_argument('--threshold', type=float, default=float(os.getenv('DETECTION_THRESHOLD', '0.5')),
-                      help='Detection threshold')
+    parser.add_argument('--threshold', type=float, default=float(os.getenv('DETECTION_THRESHOLD', '0.3')),
+                      help='Detection threshold (default: 0.3)')
     parser.add_argument('--save-frames', type=bool, default=os.getenv('SAVE_FRAMES', 'false').lower() == 'true',
                       help='Save processed frames')
     parser.add_argument('--cooldown-period', type=int, default=int(os.getenv('COOLDOWN_PERIOD', '60')),
@@ -320,9 +359,8 @@ def main():
 
     args = parser.parse_args()
     
-    # Add TCP transport if not specified in URL
-    if args.rtsp_url and 'rtsp://' in args.rtsp_url and '?' not in args.rtsp_url:
-        args.rtsp_url += '?tcp'
+    # Check for dependencies
+    install_dependencies()
     
     # Set higher priority for process
     try:
