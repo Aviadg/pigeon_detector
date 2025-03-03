@@ -5,6 +5,7 @@ from datetime import datetime
 import time
 import os
 import RPi.GPIO as GPIO
+import glob
 
 class YOLOBirdMonitor:
     def __init__(self, rtsp_url, model_path, threshold=0.5, 
@@ -47,25 +48,37 @@ class YOLOBirdMonitor:
             self.cap.release()
     
     def load_model(self):
-        """Load the YOLO model"""
+        """Load the YOLO model - prefer pre-converted NCNN models"""
         try:
             from ultralytics import YOLO
             
-            # Check if the model is already in NCNN format
-            if not os.path.isdir(self.model_path) and self.model_path.endswith(('.pt', '.pth', '.torchscript')):
-                print(f"Converting model {self.model_path} to NCNN format for better performance on Raspberry Pi...")
-                # Load original model
-                orig_model = YOLO(self.model_path)
-                
-                # Export to NCNN format
-                ncnn_path = f"{os.path.splitext(self.model_path)[0]}_ncnn_model"
-                orig_model.export(format="ncnn")
-                
-                # Use the exported model
+            # Check if we should use a pre-converted model
+            ncnn_models = []
+            model_dir = os.path.dirname(self.model_path)
+            model_base = os.path.splitext(os.path.basename(self.model_path))[0]
+            
+            # Look for NCNN models
+            ncnn_pattern = os.path.join(model_dir, f"{model_base}_ncnn_model*")
+            ncnn_models = glob.glob(ncnn_pattern)
+            
+            # If no exact match, look for any NCNN model
+            if not ncnn_models:
+                ncnn_models = glob.glob(os.path.join(model_dir, "*_ncnn_model*"))
+            
+            # Use NCNN model if available
+            if ncnn_models:
+                # Get the directory path of the first NCNN model
+                ncnn_path = os.path.dirname(ncnn_models[0])
+                if not ncnn_path:  # If in current directory
+                    ncnn_path = os.path.splitext(ncnn_models[0])[0]
+                else:
+                    ncnn_path = os.path.join(ncnn_path, os.path.splitext(os.path.basename(ncnn_models[0]))[0])
+                    
+                print(f"Using pre-converted NCNN model: {ncnn_path}")
                 self.model = YOLO(ncnn_path)
-                print(f"Model exported to {ncnn_path}")
             else:
-                # Model is already in NCNN format or is a directory
+                # No pre-converted model found, use original one
+                print(f"No pre-converted NCNN model found. Using original model: {self.model_path}")
                 self.model = YOLO(self.model_path)
             
             # Set confidence threshold
@@ -256,7 +269,7 @@ def main():
     parser = argparse.ArgumentParser(description='YOLO Bird Detection from RTSP Stream')
     parser.add_argument('--rtsp-url', type=str, default=os.getenv('RTSP_URL'),
                       help='RTSP URL for camera stream')
-    parser.add_argument('--model-path', type=str, default='yolo11n.pt',
+    parser.add_argument('--model-path', type=str, default='models/yolov8n.pt',
                       help='Path to Ultralytics YOLO model')
     parser.add_argument('--threshold', type=float, default=float(os.getenv('DETECTION_THRESHOLD', '0.5')),
                       help='Detection threshold')
@@ -270,7 +283,7 @@ def main():
     args = parser.parse_args()
     
     # Add TCP transport if not specified in URL
-    if 'rtsp://' in args.rtsp_url and '?' not in args.rtsp_url:
+    if args.rtsp_url and 'rtsp://' in args.rtsp_url and '?' not in args.rtsp_url:
         args.rtsp_url += '?tcp'
     
     # Check for dependencies

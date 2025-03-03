@@ -21,8 +21,4 @@ RUN pip install --no-cache-dir --extra-index-url https://www.piwheels.org/simple
 COPY src/ ./src/
 COPY models/ ./models/
 
-# Pre-convert YOLO model to NCNN format during build
-COPY convert_model.py .
-RUN python convert_model.py
-
 CMD ["python", "-u", "src/yolo_bird_monitor.py"]
