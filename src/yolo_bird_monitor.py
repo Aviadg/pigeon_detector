@@ -37,6 +37,8 @@ class YOLOBirdMonitor:
         # Initialize video capture
         self.cap = None
         self.last_detection_check = 0  # Track when we last ran detection
+        self.reconnect_count = 0
+        self.last_frame_time = 0
         
         # Load model flag - defer actual loading until first use
         self.model = None
@@ -68,25 +70,98 @@ class YOLOBirdMonitor:
             raise
         
     def connect_camera(self):
-        """Connect to the RTSP camera stream"""
+        """Connect to the RTSP camera stream with improved settings"""
         if self.cap is not None:
             self.cap.release()
+            
+        # Completely reset the connection
+        self.reconnect_count += 1
+        print(f"Connecting to camera (attempt #{self.reconnect_count}): {self.rtsp_url}")
         
-        # Enhanced camera connection with optimized settings
-        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        # Try different connection methods based on prior success
+        if self.reconnect_count % 3 == 0:
+            # Every third attempt, try with FFMPEG backend
+            print("Trying FFMPEG backend...")
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        elif self.reconnect_count % 3 == 1:
+            # First and every third attempt thereafter, try with default backend
+            print("Trying default backend...")
+            self.cap = cv2.VideoCapture(self.rtsp_url)
+        else:
+            # Second and every third attempt thereafter, try with GSTREAMER backend
+            print("Trying GSTREAMER backend...")
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_GSTREAMER)
         
         if not self.cap.isOpened():
-            raise Exception("Failed to connect to RTSP stream")
+            print("Failed to open camera connection!")
+            return False
         
-        # Optimize for latency
+        # Try to disable buffering
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
-        print(f"Connected to camera: {self.rtsp_url}")
+        # Try to limit frame rate
+        self.cap.set(cv2.CAP_PROP_FPS, 1)
+        
+        # Try to reset position
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        # Read a test frame to confirm connection
+        ret, frame = self.cap.read()
+        if not ret or frame is None or frame.size == 0:
+            print("Could open camera but failed to read frame!")
+            self.cap.release()
+            self.cap = None
+            return False
+            
+        print(f"Successfully connected to camera. Frame size: {frame.shape}")
+        return True
 
-    def flush_buffer(self):
-        """Flush the buffer to get the latest frame"""
-        for _ in range(3):  # Grab a few frames to clear buffer
+    def get_new_frame(self):
+        """Get a new frame from the camera with improved handling"""
+        # Check if we have a valid camera connection
+        if self.cap is None or not self.cap.isOpened():
+            if not self.connect_camera():
+                time.sleep(2)  # Wait before retrying
+                return None
+        
+        # Clear any buffered frames
+        for _ in range(10):  # Drop more frames to ensure we get a fresh one
             self.cap.grab()
+        
+        # Try to get a new frame
+        ret, frame = self.cap.read()
+        
+        # Validate the frame
+        if not ret or frame is None or frame.size == 0:
+            print("Failed to grab valid frame from camera")
+            # Force reconnect
+            self.cap.release()
+            self.cap = None
+            return None
+        
+        # Check for frame similarity (stuck frame detection)
+        current_time = time.time()
+        if hasattr(self, 'last_frame') and self.last_frame is not None:
+            # Calculate rough similarity using mean of absolute difference
+            diff = cv2.absdiff(frame, self.last_frame)
+            mean_diff = np.mean(diff)
+            
+            # If frames are too similar and it's been more than 2 seconds
+            if mean_diff < 0.1 and (current_time - self.last_frame_time) > 2.0:
+                print(f"WARNING: Detected potentially stuck frame (diff: {mean_diff:.4f})")
+                
+                # Try reconnecting if frames appear stuck
+                if mean_diff < 0.05:
+                    print("Frame appears stuck, reconnecting...")
+                    self.cap.release()
+                    self.cap = None
+                    return None
+        
+        # Update frame tracking
+        self.last_frame = frame.copy()
+        self.last_frame_time = current_time
+        
+        return frame
     
     def save_frame(self, frame, confidence):
         """Save the processed frame if enabled"""
@@ -94,7 +169,8 @@ class YOLOBirdMonitor:
             return None
             
         is_bird = confidence >= self.threshold
-        filename = f"frame_{self.frame_counter:04d}_{'bird' if is_bird else 'nobird'}_{confidence:.2%}.jpg"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"frame_{timestamp}_{self.frame_counter:04d}_{'bird' if is_bird else 'nobird'}_{confidence:.2%}.jpg"
         filepath = os.path.join(self.results_dir, filename)
         cv2.imwrite(filepath, frame)
         self.frame_counter += 1
@@ -168,18 +244,13 @@ class YOLOBirdMonitor:
         
         while True:
             try:
-                if self.cap is None or not self.cap.isOpened():
-                    print("Connecting to camera...")
-                    self.connect_camera()
+                # Get a new frame with improved handling
+                frame = self.get_new_frame()
                 
-                # Get current frame with optimized buffer management
-                self.flush_buffer()
-                ret, frame = self.cap.read()
-                
-                if not ret or frame is None or frame.size == 0:
-                    print("Failed to grab valid frame, attempting to reconnect...")
+                if frame is None:
+                    # If we couldn't get a valid frame, retry after a delay
+                    print("Failed to get valid frame, retrying...")
                     time.sleep(1)
-                    self.connect_camera()
                     continue
                 
                 # Update frame count
@@ -208,11 +279,17 @@ class YOLOBirdMonitor:
                     print(f"Confidence: {confidence:.2%}")
                     print(f"Consecutive detections: {self.consecutive_detections}")
                     print(f"In cooldown: {self.in_cooldown}")
-                    print(f"Average frame rate: {frame_count/elapsed_time:.2f} fps")
+                    print(f"Frames processed: {frame_count}")
+                    if elapsed_time > 0:
+                        print(f"Average frame rate: {frame_count/elapsed_time:.2f} fps")
                     print("-" * 50)
                 
                 # Sleep to prevent CPU overuse and maintain ~1 fps processing rate
-                time.sleep(1.0)
+                # Use adaptive sleep to maintain close to 1 fps
+                processing_time = time.time() - current_time
+                sleep_time = max(0, 1.0 - processing_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
                 
             except KeyboardInterrupt:
                 print("\nStopping monitoring...")
@@ -225,22 +302,6 @@ class YOLOBirdMonitor:
         
         if self.cap is not None:
             self.cap.release()
-
-def install_dependencies():
-    """Install required dependencies if not already installed"""
-    try:
-        import ultralytics
-        print("Ultralytics already installed")
-    except ImportError:
-        print("Installing Ultralytics YOLO...")
-        os.system("pip install ultralytics")
-    
-    try:
-        import cv2
-        print("OpenCV already installed")
-    except ImportError:
-        print("Installing OpenCV...")
-        os.system("pip install opencv-python")
 
 def main():
     parser = argparse.ArgumentParser(description='YOLO Bird Detection from RTSP Stream')
