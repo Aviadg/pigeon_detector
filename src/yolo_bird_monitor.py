@@ -5,7 +5,6 @@ from datetime import datetime
 import time
 import os
 import RPi.GPIO as GPIO
-import glob
 
 class YOLOBirdMonitor:
     def __init__(self, rtsp_url, model_path, threshold=0.5, 
@@ -39,8 +38,8 @@ class YOLOBirdMonitor:
         self.cap = None
         self.last_detection_check = 0  # Track when we last ran detection
         
-        # Load YOLO model
-        self.load_model()
+        # Load model flag - defer actual loading until first use
+        self.model = None
         
     def __del__(self):
         GPIO.cleanup()
@@ -48,38 +47,16 @@ class YOLOBirdMonitor:
             self.cap.release()
     
     def load_model(self):
-        """Load the YOLO model - prefer pre-converted NCNN models"""
+        """Load the YOLO model - only when needed"""
+        if self.model is not None:
+            return
+
         try:
             from ultralytics import YOLO
             
-            # Check if we should use a pre-converted model
-            ncnn_models = []
-            model_dir = os.path.dirname(self.model_path)
-            model_base = os.path.splitext(os.path.basename(self.model_path))[0]
-            
-            # Look for NCNN models
-            ncnn_pattern = os.path.join(model_dir, f"{model_base}_ncnn_model*")
-            ncnn_models = glob.glob(ncnn_pattern)
-            
-            # If no exact match, look for any NCNN model
-            if not ncnn_models:
-                ncnn_models = glob.glob(os.path.join(model_dir, "*_ncnn_model*"))
-            
-            # Use NCNN model if available
-            if ncnn_models:
-                # Get the directory path of the first NCNN model
-                ncnn_path = os.path.dirname(ncnn_models[0])
-                if not ncnn_path:  # If in current directory
-                    ncnn_path = os.path.splitext(ncnn_models[0])[0]
-                else:
-                    ncnn_path = os.path.join(ncnn_path, os.path.splitext(os.path.basename(ncnn_models[0]))[0])
-                    
-                print(f"Using pre-converted NCNN model: {ncnn_path}")
-                self.model = YOLO(ncnn_path)
-            else:
-                # No pre-converted model found, use original one
-                print(f"No pre-converted NCNN model found. Using original model: {self.model_path}")
-                self.model = YOLO(self.model_path)
+            # Load the model
+            print(f"Loading YOLO model from {self.model_path}...")
+            self.model = YOLO(self.model_path)
             
             # Set confidence threshold
             self.model.conf = self.threshold
@@ -103,15 +80,12 @@ class YOLOBirdMonitor:
         
         # Optimize for latency
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
         
         print(f"Connected to camera: {self.rtsp_url}")
 
     def flush_buffer(self):
         """Flush the buffer to get the latest frame"""
-        for _ in range(5):  # Clear several frames to get the most recent
+        for _ in range(3):  # Grab a few frames to clear buffer
             self.cap.grab()
     
     def save_frame(self, frame, confidence):
@@ -160,6 +134,10 @@ class YOLOBirdMonitor:
     def detect_birds(self, frame):
         """Run YOLO detection on a frame and look for birds"""
         start_time = time.time()
+        
+        # Ensure model is loaded
+        if self.model is None:
+            self.load_model()
         
         # Run detection
         results = self.model(frame, verbose=False)
@@ -233,8 +211,8 @@ class YOLOBirdMonitor:
                     print(f"Average frame rate: {frame_count/elapsed_time:.2f} fps")
                     print("-" * 50)
                 
-                # Small delay to prevent CPU overuse
-                time.sleep(0.05)
+                # Sleep to prevent CPU overuse and maintain ~1 fps processing rate
+                time.sleep(1.0)
                 
             except KeyboardInterrupt:
                 print("\nStopping monitoring...")
@@ -257,19 +235,18 @@ def install_dependencies():
         print("Installing Ultralytics YOLO...")
         os.system("pip install ultralytics")
     
-    # Install NCNN dependencies if not present
     try:
-        import ncnn
-        print("NCNN already installed")
+        import cv2
+        print("OpenCV already installed")
     except ImportError:
-        print("Installing NCNN dependencies...")
-        os.system("pip install ncnn")
+        print("Installing OpenCV...")
+        os.system("pip install opencv-python")
 
 def main():
     parser = argparse.ArgumentParser(description='YOLO Bird Detection from RTSP Stream')
     parser.add_argument('--rtsp-url', type=str, default=os.getenv('RTSP_URL'),
                       help='RTSP URL for camera stream')
-    parser.add_argument('--model-path', type=str, default='models/yolov8n.pt',
+    parser.add_argument('--model-path', type=str, default='yolov8n.pt',
                       help='Path to Ultralytics YOLO model')
     parser.add_argument('--threshold', type=float, default=float(os.getenv('DETECTION_THRESHOLD', '0.5')),
                       help='Detection threshold')
@@ -285,9 +262,6 @@ def main():
     # Add TCP transport if not specified in URL
     if args.rtsp_url and 'rtsp://' in args.rtsp_url and '?' not in args.rtsp_url:
         args.rtsp_url += '?tcp'
-    
-    # Check for dependencies
-    install_dependencies()
     
     # Set higher priority for process
     try:
